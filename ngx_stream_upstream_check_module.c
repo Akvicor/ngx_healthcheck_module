@@ -24,6 +24,8 @@ typedef struct {
 
     size_t                                   padding;
     size_t                                   length;
+
+    ngx_flag_t                               connection_close;
 } ngx_stream_upstream_check_ctx_t;
 
 
@@ -784,7 +786,7 @@ ngx_stream_upstream_check_peek_handler(ngx_event_t *event)
 
     if (ngx_stream_upstream_check_peek_one_byte(c, peer) == NGX_OK) {
         ngx_stream_upstream_check_status_update(peer, 1); //up
-
+        c->requests++;
     } else {
         c->error = 1;
         ngx_stream_upstream_check_status_update(peer, 0); //down
@@ -1109,7 +1111,9 @@ ngx_stream_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
     ngx_int_t                            rc;
     ngx_uint_t                           code, code_n;
     ngx_stream_upstream_check_ctx_t       *ctx;
-    ngx_upstream_check_srv_conf_t  *ucscf;
+    ngx_upstream_check_srv_conf_t        *ucscf;
+    u_char                              *p, *last;
+    ngx_flag_t                           connection_close = 0;
 
     ucscf = peer->conf;
     ctx = peer->check_data;
@@ -1130,6 +1134,31 @@ ngx_stream_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
             return rc;
         }
 
+        // 解析响应头，检查Connection字段
+        p = ctx->recv.pos;
+        last = ctx->recv.last;
+
+        while (p < last) {
+            if (ngx_strncasecmp(p, (u_char *) "connection:", 11) == 0) {
+                p += 11;
+                while (p < last && (*p == ' ' || *p == '\t')) p++;
+
+                if (ngx_strncasecmp(p, (u_char *) "close", 5) == 0) {
+                    connection_close = 1;
+                    break;
+                }
+            }
+
+            // 找到行结束
+            while (p < last && *p != '\n') p++;
+            if (p < last) p++; // 跳过\n
+
+            // 检查是否到达头部结束
+            if (p + 1 < last && *p == '\r' && *(p+1) == '\n') {
+                break;
+            }
+        }
+
         code = ctx->status.code;
 
         if (code >= 200 && code < 300) {
@@ -1138,71 +1167,25 @@ ngx_stream_upstream_check_http_parse(ngx_upstream_check_peer_t *peer)
             code_n = NGX_CHECK_HTTP_3XX;
         } else if (code >= 400 && code < 500) {
             peer->pc.connection->error = 1;
+            connection_close = 1; // 4xx错误通常需要关闭连接
             code_n = NGX_CHECK_HTTP_4XX;
         } else if (code >= 500 && code < 600) {
             peer->pc.connection->error = 1;
+            connection_close = 1; // 5xx错误通常需要关闭连接
             code_n = NGX_CHECK_HTTP_5XX;
         } else {
             peer->pc.connection->error = 1;
+            connection_close = 1;
             code_n = NGX_CHECK_HTTP_ERR;
         }
 
-        // find content length from [Content-Length: (\d+)\r]
-        *ctx->status.end = '\0';
-        u_char * content_len_start = (u_char *)ngx_strstr(ctx->status.start, "Content-Length:");
-        u_char * content_len_end = NULL;
-        ngx_uint_t found_body_len, body_len = 0;
-        if (content_len_start != NULL) {
-            content_len_end = ngx_strlchr(content_len_start, ctx->status.end, '\r');
-            if (content_len_end != NULL) {
-                found_body_len = 1;
-                ngx_str_t content_len_line = {content_len_end-content_len_start, content_len_start};
-                body_len = ngx_atoi(content_len_line.data + sizeof("Content-Length: ")-1,
-                                    content_len_line.len - (sizeof("Content-Length: ")-1));
-                ngx_log_error(NGX_LOG_INFO, ngx_cycle->log, 0, MODULE_NAME
-                              "[http-response-parse]: found content-length: [%V],value: %ui",
-                              &content_len_line, body_len);
-            }
-        }
+        // 存储连接状态信息用于后续决策
+        ctx->connection_close = connection_close;
 
-        ngx_str_t response_body = {ctx->recv.last - ctx->recv.pos, ctx->recv.pos};
-
-        ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                "[http-response-parse]: "
-                "code: %ui, expect code mask: %ui. "
-                "received body len: %ui, content:[%V]",
-                code, ucscf->code.status_alive,
-                response_body.len, &response_body);
-
-        if (!(code_n & ucscf->code.status_alive)) {
-            ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                          "[http-response-parse]: code not matched");
-            return NGX_ERROR;
-        } else if (ucscf->expect_body_regex != NGX_CONF_UNSET_PTR) {
-            if (found_body_len == 1 && response_body.len < body_len) {
-                return NGX_AGAIN;
-            }
-            /* body check */
-            ngx_int_t n;
-            n = ngx_regex_exec(ucscf->expect_body_regex, &response_body, NULL, 0);
-            if (n == NGX_REGEX_NO_MATCHED) {
-                if (found_body_len == 1) {
-                    ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                                  "[http-response-parse]: body not matched");
-                    return NGX_ERROR;
-                } else {
-                    /* we don't known the end flag, so we have to wait next match util timeout */
-                    return NGX_AGAIN;
-                }
-            } else {
-                ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                              "[http-response-parse]: body matched");
-                return NGX_OK;
-            }
-        } else {
-            ngx_log_debug(LOG_LEVEL, ngx_cycle->log, 0, MODULE_NAME
-                          "[http-response-parse]: code matched");
+        if (code_n & ucscf->code.status_alive) {
             return NGX_OK;
+        } else {
+            return NGX_ERROR;
         }
     } else {
         return NGX_AGAIN;
@@ -1239,7 +1222,11 @@ ngx_stream_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
     ucscf = peer->conf;
 
     if (result) { //up
-        peer->shm->rise_count++;
+        if(peer->shm->rise_count < (ngx_uint_t)-1) {
+            peer->shm->rise_count++;
+        }else{
+            peer->shm->rise_count = ucscf->rise_count;
+        }
         peer->shm->fall_count = 0;
         if (peer->shm->down && peer->shm->rise_count >= ucscf->rise_count) {
             peer->shm->down = 0;
@@ -1250,7 +1237,11 @@ ngx_stream_upstream_check_status_update(ngx_upstream_check_peer_t *peer,
         }
     } else {
         peer->shm->rise_count = 0;
-        peer->shm->fall_count++;
+        if(peer->shm->fall_count < (ngx_uint_t)-1) {
+            peer->shm->fall_count++;
+        }else{
+            peer->shm->fall_count = ucscf->fall_count;
+        }
         if (!peer->shm->down && peer->shm->fall_count >= ucscf->fall_count) {
             peer->shm->down = 1;
             ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0, MODULE_NAME
@@ -1268,27 +1259,46 @@ static void
 ngx_stream_upstream_check_clean_event(ngx_upstream_check_peer_t *peer)
 {
     ngx_connection_t                    *c;
-    ngx_upstream_check_srv_conf_t  *ucscf;
+    ngx_upstream_check_srv_conf_t       *ucscf;
     ngx_check_conf_t                    *cf;
+    ngx_stream_upstream_check_ctx_t     *ctx;
+    ngx_flag_t                           reusable = 0;
 
     c = peer->pc.connection;
     ucscf = peer->conf;
     cf = ucscf->check_type_conf;
+    ctx = peer->check_data;
 
     if (c) {
         ngx_log_debug2(LOG_LEVEL, c->log, 0, MODULE_NAME
                        "check clean event: index:%i, fd: %d",
                        peer->index, c->fd);
         if (c->error == 0 &&
+            !c->timedout &&
             cf->need_keepalive &&
             (c->requests < ucscf->check_keepalive_requests))
         {
+            // 如果有HTTP上下文，检查服务器是否要求关闭连接
+            if (ctx && !ctx->connection_close) {
+                reusable = 1;
+            } else if (!ctx) {
+                // 非HTTP检查类型，如TCP
+                reusable = 1;
+            }
+        }
+
+        if (reusable) {
             c->write->handler = ngx_stream_upstream_check_dummy_handler;
             c->read->handler = ngx_stream_upstream_check_discard_handler;
+            ngx_add_timer(c->read, 30000); // 30秒后清理
         } else {
+            struct linger so_linger;
+            so_linger.l_onoff = 1;
+            so_linger.l_linger = 0;
+            setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(so_linger));
             ngx_close_connection(c);
-            peer->pc.connection = NULL;
         }
+        peer->pc.connection = NULL;
     }
 
     if (peer->check_timeout_ev.timer_set) {
